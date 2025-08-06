@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 class Database:
     """
     Handles all database operations for the application, including connecting to
-    PostgreSQL, creating tables, and managing records, batches, and events.
+    PostgreSQL, creating tables, and managing records, batches, and events,
+    and now family relationships.
     """
     def __init__(self):
         """Initializes the database connection using credentials from Streamlit secrets."""
@@ -95,6 +96,18 @@ class Database:
                     record_id INTEGER REFERENCES records(id) ON DELETE CASCADE,
                     event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
                     PRIMARY KEY (record_id, event_id)
+                )
+            """)
+
+            # Family Relationships Table: Stores connections between records as family members.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS family_connections (
+                    id SERIAL PRIMARY KEY,
+                    source_record_id INTEGER REFERENCES records(id) ON DELETE CASCADE,
+                    target_record_id INTEGER REFERENCES records(id) ON DELETE CASCADE,
+                    relationship_to_source VARCHAR(50) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (source_record_id, target_record_id, relationship_to_source)
                 )
             """)
             self.conn.commit()
@@ -263,7 +276,8 @@ class Database:
                     phone_number, whatsapp_number, facebook_link, tiktok_link, youtube_link, insta_link, photo_link, description,
                     political_status, relationship_status, gender, age
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
+                RETURNING id
+            """, ( # Added RETURNING id here
                 batch_id, file_name,
                 record_data.get('ক্রমিক_নং'), record_data.get('নাম'),
                 record_data.get('ভোটার_নং'), record_data.get('পিতার_নাম'),
@@ -277,6 +291,8 @@ class Database:
                 record_data.get('gender'),
                 record_data.get('age')
             ))
+            return cur.fetchone()[0] # Return the ID of the newly added record
+
 
     def commit_changes(self):
         """Commits the current database transaction."""
@@ -337,19 +353,43 @@ class Database:
     def search_records_advanced(self, criteria):
         """Performs an advanced search for records based on multiple criteria."""
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = "SELECT r.*, b.name as batch_name FROM records r JOIN batches b ON r.batch_id = b.id WHERE 1=1"
+            query_parts = []
             params = []
+
+            # Handle 'নাম' and 'ভোটার_নং' with OR logic if both are provided
+            name_query = criteria.get('নাম')
+            voter_no_query = criteria.get('ভোটার_নং')
+
+            if name_query and voter_no_query and name_query == voter_no_query:
+                # If the same query is used for both, search either name OR voter_no
+                query_parts.append("(নাম ILIKE %s OR ভোটার_নং ILIKE %s)")
+                params.extend([f"%{name_query}%", f"%{voter_no_query}%"])
+            else:
+                # Otherwise, treat them as separate AND conditions or if only one is present
+                if name_query:
+                    query_parts.append("নাম ILIKE %s")
+                    params.append(f"%{name_query}%")
+                if voter_no_query:
+                    query_parts.append("ভোটার_নং ILIKE %s")
+                    params.append(f"%{voter_no_query}%")
+
+            # Handle other criteria (e.g., gender) with AND logic
             for field, value in criteria.items():
-                if value:
-                    # Special handling for 'gender' to allow exact match or 'সব' for all
+                if field not in ['নাম', 'ভোটার_নং'] and value:
                     if field == 'gender' and value != 'সব':
-                        query += f" AND {field} = %s"
+                        query_parts.append(f"{field} = %s")
                         params.append(value)
-                    elif field != 'gender': # For other fields, use ILIKE
-                        query += f" AND {field} ILIKE %s"
+                    elif field != 'gender':
+                        query_parts.append(f"{field} ILIKE %s")
                         params.append(f"%{value}%")
-            query += " ORDER BY r.id"
-            cur.execute(query, params)
+            
+            final_query = "SELECT r.*, b.name as batch_name FROM records r JOIN batches b ON r.batch_id = b.id"
+            if query_parts:
+                final_query += " WHERE " + " AND ".join(query_parts)
+            
+            final_query += " ORDER BY r.id"
+            
+            cur.execute(final_query, params)
             records = cur.fetchall()
         for record in records:
             record['events'] = self.get_events_for_record(record['id'])
@@ -502,3 +542,90 @@ class Database:
         with self.conn.cursor() as cur:
             cur.execute("UPDATE records SET age = %s WHERE id = %s", (age, record_id))
             # No commit here, as it will be part of a larger transaction in the age management page
+
+    def get_record_by_id(self, record_id: int):
+        """Retrieves a single record by its ID."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT r.*, b.name as batch_name
+                FROM records r
+                JOIN batches b ON r.batch_id = b.id
+                WHERE r.id = %s
+            """, (record_id,))
+            record = cur.fetchone()
+            if record:
+                record['events'] = self.get_events_for_record(record['id'])
+            return record
+
+    def get_record_by_voter_no(self, voter_no: str):
+        """Retrieves a single record by its voter number."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT r.*, b.name as batch_name
+                FROM records r
+                JOIN batches b ON r.batch_id = b.id
+                WHERE r.ভোটার_নং = %s
+            """, (voter_no,))
+            record = cur.fetchone()
+            if record:
+                record['events'] = self.get_events_for_record(record['id'])
+            return record
+
+    def add_family_connection(self, source_record_id: int, target_record_id: int, relationship_to_source: str):
+        """
+        Adds a family connection between two records.
+        This function adds a unidirectional relationship from source to target.
+        For bidirectional relationships (e.g., parent-child), call this function twice.
+        """
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    INSERT INTO family_connections (source_record_id, target_record_id, relationship_to_source)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (source_record_id, target_record_id, relationship_to_source) DO NOTHING
+                """, (source_record_id, target_record_id, relationship_to_source))
+                self.conn.commit()
+                return True
+            except psycopg2.Error as e:
+                logger.error(f"Error adding family connection: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_family_connections_for_record(self, record_id: int):
+        """
+        Retrieves all family connections for a given record.
+        Returns a list of dictionaries, each containing the connected record's details
+        and the relationship type to the source record.
+        """
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    fc.relationship_to_source,
+                    r.id, r.নাম, r.ভোটার_নং, r.পিতার_নাম, r.মাতার_নাম, r.photo_link, r.gender, r.age
+                FROM family_connections fc
+                JOIN records r ON fc.target_record_id = r.id
+                WHERE fc.source_record_id = %s
+                ORDER BY r.নাম
+            """, (record_id,))
+            return cur.fetchall()
+
+    def delete_family_connection(self, source_record_id: int, target_record_id: int, relationship_to_source: str):
+        """Deletes a specific unidirectional family connection."""
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    DELETE FROM family_connections
+                    WHERE source_record_id = %s AND target_record_id = %s AND relationship_to_source = %s
+                """, (source_record_id, target_record_id, relationship_to_source))
+                self.conn.commit()
+                return True
+            except psycopg2.Error as e:
+                logger.error(f"Error deleting family connection: {e}")
+                self.conn.rollback()
+                return False
+
+    def get_all_voters_for_search(self):
+        """Retrieves a minimal set of voter data for search/selection dropdowns."""
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, নাম, ভোটার_নং, পিতার_নাম, মাতার_নাম, photo_link FROM records ORDER BY নাম")
+            return cur.fetchall()
